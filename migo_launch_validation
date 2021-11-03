@@ -1,0 +1,77 @@
+with transactions as ( 
+select ROW_NUMBER() over(partition by store_id,transaction_day order by store_id,transaction_day,transaction_time) id_migo_mania,
+       *, 
+       case when id=1 then 'new' else 'existing' end status
+from (
+select 	ROW_NUMBER() over(partition by new_device_id order by transaction_day) id
+        ,*
+        ,case when lead(transaction_day,1) over(partition by new_device_id order by transaction_day) is null then (getdate()+interval '7 hours')::date
+         else lead(transaction_day,1) over(partition by new_device_id order by transaction_day)
+         end next_transaction_date
+from (
+select 
+        new_device_id,
+        RIGHT(new_device_id,10) migoid, 
+		transaction_day,
+		store_id,
+		store_name,
+		sale_type, 
+		case when fraud_flag=0 then 'no_fraud' else 'fraud' end fraud_flag, 
+		min(transaction_time) transaction_time,
+		sum(transaction_with_download) transaction_with_download,
+		sum(gross_revenue) gross_revenue 
+from analytics.transactions_v 
+where transaction_day>'2021-10-04' 
+--and store_id in ('C00625','C00628')
+group by 1,2,3,4,5,6,7
+order by transaction_day, new_device_id 
+) a
+) a 
+),
+
+transaction_main as (
+select * from (
+select ROW_NUMBER() over(partition by new_device_id,id order by b.calendar_day) id_calendar_day,
+       a.*,
+       b.calendar_day
+from transactions a
+cross join bi_schema.dim_calendar_date_t b 
+where calendar_day between transaction_day and next_transaction_date
+order by new_device_id,calendar_day 
+) a --where id_calendar_day<=3
+),
+
+point as (
+select *,
+       migo_point-previous_migo_point point_day
+from (
+select  device_id,
+		(event_time+interval '7 hours')::date event_day,
+		max(migo_point) migo_point ,
+		min(previous_migo_point) previous_migo_point
+from bi_schema.user_event ue
+where event_id in ('migo_point_increased') 
+--and device_id='0011093349069560' 
+group by 1,2
+order by event_day
+) a
+),
+
+fix_data as (
+select * from (
+select a.*,
+       ROW_NUMBER() over(partition by new_device_id,id order by new_device_id,id,calendar_day) day_to,
+       b.event_day,
+       b.point_day,
+       sum (b.point_day)over (partition by new_device_id,id order by new_device_id,id,calendar_day asc ROWS between unbounded preceding and current row) as point_day_cum
+from transaction_main a
+left outer join point b on a.new_device_id=b.device_id and b.event_day=a.calendar_day
+order by new_device_id,calendar_day
+) a 
+where day_to<=3
+)
+
+select a.*,b.registered_date,user_name,user_phone_number from fix_data a
+left join bi_schema.dim_unique_subscriber_t b on a.new_device_id=b.deviceid 
+--where id_migo_mania<=150
+order by store_id,id_migo_mania,id_calendar_day
